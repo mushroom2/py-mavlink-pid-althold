@@ -29,10 +29,10 @@ from pymavlink import mavutil
 # Configuration
 # ----------------------------------------------------------------------------
 CONNECTION    = "udp:127.0.0.1:14550"
-RATE_HZ       = 100
+RATE_HZ       = 10
 HOVER_THRUST  = 0.5
 REACH_TOL     = 0.1
-STREAM_TIMEOUT = 0.1
+STREAM_TIMEOUT = 0.3
 
 # --- Altitude PID (error [m]; derivative on climb rate vz) ---
 ALT_KP, ALT_KI, ALT_KD, ALT_ILIM = 0.12, 0.045, 0.1, 0.30
@@ -152,7 +152,7 @@ class MavlinkCommunicator(object):
             self.conn.target_system, self.conn.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
             mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
-            int(1e6 / hz), 0, 0, 0, 0, 0)
+            int(1e5 / hz), 0, 0, 0, 0, 0)
 
 
     # ----------------------------------------------------------------------------
