@@ -20,8 +20,9 @@ REACH_TOL     = 0.1
 STREAM_TIMEOUT = 0.3
 
 # --- Altitude PID (error [m]; derivative on climb rate vz) ---
-ALT_KP, ALT_KI, ALT_KD, ALT_ILIM = 0.12, 0.045, 0.1, 0.30
-THRUST_MIN, THRUST_MAX = 0.0, 0.5
+ALT_KP, ALT_KI, ALT_KD, ALT_ILIM = 0.22, 0.09, 0.22, 0.20
+THRUST_MIN, THRUST_MAX = 0.05, 0.5
+CLIMB_RATE_MAX = 2.5   # [m/s] setpoint slew limit -> no windup, no violent climbs/drops
 
 # --- Horizontal velocity PIDs (error [m/s] -> tilt [rad]) ---
 VEL_KP_PITCH, VEL_KI_PITCH, VEL_KD_PITCH, VEL_ILIM_PITCH = 0.04, 0.01, 0.005, 0.05
@@ -36,44 +37,59 @@ STALE_WARN = 0.5
 
 
 class PID:
-    def __init__(self, kp, ki, kd, i_limit, out_limit=None, d_window=D_WINDOW):
+    """PID with feed-forward, asymmetric output limits, and anti-windup.
+
+    Anti-windup (conditional integration): the integrator is committed only if
+    the output is NOT pinned against a limit while the error would push it
+    further into that limit. This is what stops the wind-up that made the
+    ground->15m climb overshoot and ring in the logged run.
+    """
+    def __init__(self, kp, ki, kd, i_limit, out_min=None, out_max=None,
+                 feedforward=0.0, d_window=D_WINDOW):
         self.kp, self.ki, self.kd = kp, ki, kd
         self.i_limit = i_limit
-        self.out_limit = out_limit
+        self.out_min, self.out_max = out_min, out_max
+        self.ff = feedforward
         self.integral = 0.0
         self.hist = deque(maxlen=d_window)
-        self.p_term = self.i_term = self.d_term = 0.0   # exposed for plotting
+        self.p_term = self.i_term = self.d_term = 0.0
 
     def reset(self):
         self.integral = 0.0
         self.hist.clear()
 
     def update(self, error, dt, meas_rate=None):
-        self.integral += self.ki * error * dt
-        self.integral = max(-self.i_limit, min(self.i_limit, self.integral))
         if meas_rate is not None:
             d = -meas_rate
         else:
             self.hist.append(error)
-            if len(self.hist) >= 2:
-                d = (self.hist[-1] - self.hist[0]) / (dt * (len(self.hist) - 1))
-            else:
-                d = 0.0
-        self.p_term = self.kp * error
-        self.i_term = self.integral
-        self.d_term = self.kd * d
-        out = self.p_term + self.i_term + self.d_term
-        if self.out_limit is not None:
-            out = max(-self.out_limit, min(self.out_limit, out))
-        return out
+            d = ((self.hist[-1] - self.hist[0]) / (dt * (len(self.hist) - 1))
+                 if len(self.hist) >= 2 else 0.0)
+
+        integ = self.integral + self.ki * error * dt
+        integ = max(-self.i_limit, min(self.i_limit, integ))
+
+        self.p_term, self.i_term, self.d_term = self.kp * error, integ, self.kd * d
+        out = self.ff + self.p_term + self.i_term + self.d_term
+
+        lo = self.out_min if self.out_min is not None else -1e18
+        hi = self.out_max if self.out_max is not None else 1e18
+        sat = max(lo, min(hi, out))
+        if not ((out > hi and error > 0) or (out < lo and error < 0)):
+            self.integral = integ          # commit only when not winding into a rail
+        return sat
 
 
 class Controller:
     def __init__(self, hover):
         self.hover = hover
-        self.alt   = PID(ALT_KP, ALT_KI, ALT_KD, ALT_ILIM)
-        self.pitch = PID(VEL_KP_PITCH, VEL_KI_PITCH, VEL_KD_PITCH, VEL_ILIM_PITCH, out_limit=TILT_MAX)
-        self.roll  = PID(VEL_KP_ROLL,  VEL_KI_ROLL,  VEL_KD_ROLL,  VEL_ILIM_ROLL,  out_limit=TILT_MAX)
+        # altitude PID outputs THRUST directly (ff=hover, clamped to thrust limits)
+        self.alt   = PID(ALT_KP, ALT_KI, ALT_KD, ALT_ILIM,
+                         out_min=THRUST_MIN, out_max=THRUST_MAX, feedforward=hover)
+        self.pitch = PID(VEL_KP_PITCH, VEL_KI_PITCH, VEL_KD_PITCH, VEL_ILIM_PITCH,
+                         out_min=-TILT_MAX, out_max=TILT_MAX)
+        self.roll  = PID(VEL_KP_ROLL,  VEL_KI_ROLL,  VEL_KD_ROLL,  VEL_ILIM_ROLL,
+                         out_min=-TILT_MAX, out_max=TILT_MAX)
         self.yaw_target = None
 
     def reset(self):
@@ -236,6 +252,7 @@ class Copter(object):
         print(f"\n=== Target {target_alt} m, hold {hold_time} s ===")
         self.ctrl.reset()
         period = 1.0 / RATE_HZ
+        sp = self.state.alt            # slewed setpoint starts at current altitude
         reached_at = None
         last_print = 0.0
         last_t = time.monotonic()
@@ -254,10 +271,10 @@ class Copter(object):
                 dt = period
             dt = min(dt, 0.1)
 
-            alt_err = target_alt - alt
-            thrust = clamp(self.ctrl.hover +
-                           self.ctrl.alt.update(alt_err, dt, meas_rate=vz),
-                           THRUST_MIN, THRUST_MAX)
+            # setpoint slew: ramp internal target toward final at CLIMB_RATE_MAX
+            sp += clamp(target_alt - sp, -CLIMB_RATE_MAX * dt, CLIMB_RATE_MAX * dt)
+            alt_err = target_alt - alt          # true error (reached-check + logging)
+            thrust = self.ctrl.alt.update(sp - alt, dt, meas_rate=vz)  # ff+clamp inside
 
             fwd   =  vx * math.cos(yaw) + vy * math.sin(yaw)
             right = -vx * math.sin(yaw) + vy * math.cos(yaw)
@@ -346,6 +363,7 @@ async def main():
         try:
             await copter.hold_altitude(target_alt=14.5, hold_time=2)
             await copter.hold_altitude(target_alt=15.0, hold_time=15.0)
+            await copter.hold_altitude(target_alt=10.5, hold_time=2)
             await copter.hold_altitude(target_alt=10.0, hold_time=15.0)
             await copter.hold_altitude(target_alt=1.0,  hold_time=2)
         finally:
