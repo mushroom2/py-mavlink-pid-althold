@@ -72,11 +72,11 @@ class PID:
         self.p_term, self.i_term, self.d_term = self.kp * error, integ, self.kd * d
         out = self.ff + self.p_term + self.i_term + self.d_term
 
-        lo = self.out_min if self.out_min is not None else -1e18
-        hi = self.out_max if self.out_max is not None else 1e18
+        lo = self.out_min
+        hi = self.out_max
         sat = max(lo, min(hi, out))
         if not ((out > hi and error > 0) or (out < lo and error < 0)):
-            self.integral = integ          # commit only when not winding into a rail
+            self.integral = integ
         return sat
 
 
