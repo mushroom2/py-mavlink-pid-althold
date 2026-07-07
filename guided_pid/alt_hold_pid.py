@@ -97,6 +97,23 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def target_point(ref_n, ref_e, azimuth_deg, distance_m):
+    """NED point distance_m away at absolute bearing azimuth_deg (0=N, 90=E)."""
+    az = math.radians(azimuth_deg)
+    return (ref_n + distance_m * math.cos(az), ref_e + distance_m * math.sin(az))
+
+
+def horizontal_velocity_setpoint(target, pos_n, pos_e, kp, vmax):
+    """Speed-limited NED velocity setpoint toward target; ~0 on arrival.
+    Returns (vset_n, vset_e, dist_err)."""
+    en, ee = target[0] - pos_n, target[1] - pos_e
+    dist_err = math.hypot(en, ee)
+    if dist_err <= 1e-3:
+        return 0.0, 0.0, dist_err
+    v = min(kp * dist_err, vmax)
+    return v * en / dist_err, v * ee / dist_err, dist_err
+
+
 def _pid_str(param_id):
     if isinstance(param_id, bytes):
         return param_id.split(b"\x00", 1)[0].decode(errors="ignore")
@@ -305,14 +322,10 @@ class Copter(object):
             if alt_ok and not captured:
                 captured = True
                 if have_pos:
-                    ref_n, ref_e = self.state.pos_n, self.state.pos_e
+                    h_target = target_point(self.state.pos_n, self.state.pos_e,
+                                            phase.azimuth_deg, phase.distance_m)
                     if move_active:
-                        az = math.radians(phase.azimuth_deg)
-                        h_target = (ref_n + phase.distance_m * math.cos(az),
-                                    ref_e + phase.distance_m * math.sin(az))
                         print(f"[move] to N={h_target[0]:.1f} E={h_target[1]:.1f}")
-                    else:
-                        h_target = (ref_n, ref_e)      # station-keep here
                 else:
                     if move_active:
                         print("WARNING: no position -> skipping move, altitude-only hold")
@@ -320,17 +333,11 @@ class Copter(object):
 
             # ---- horizontal: position error -> velocity setpoint (NED) ----
             if h_target is not None:
-                en = h_target[0] - self.state.pos_n
-                ee = h_target[1] - self.state.pos_e
-                dist_err = math.hypot(en, ee)
-                if dist_err > 1e-3:
-                    v_des = min(cfg.pos_kp * dist_err, cfg.pos_speed_max_ms)
-                    vset_n, vset_e = v_des * en / dist_err, v_des * ee / dist_err
-                else:
-                    vset_n = vset_e = 0.0
+                vset_n, vset_e, dist_err = horizontal_velocity_setpoint(
+                    h_target, self.state.pos_n, self.state.pos_e,
+                    cfg.pos_kp, cfg.pos_speed_max_ms)
             else:
-                dist_err = 0.0
-                vset_n = vset_e = 0.0                   # drift arrest (climb / no pos)
+                vset_n = vset_e = dist_err = 0.0        # drift arrest (climb / no pos)
 
             # ---- velocity error -> body frame -> tilt ----
             evn, eve = vset_n - vx, vset_e - vy
