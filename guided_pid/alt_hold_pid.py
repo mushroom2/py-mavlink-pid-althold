@@ -5,47 +5,22 @@ Altitude + drift hold via SET_ATTITUDE_TARGET (thrust-as-thrust) -- ASYNC versio
 
 import asyncio
 import math
+import sys
 import time
 from collections import deque
+
 from pymavlink import mavutil
+
+from settings import Settings, ConfigError
 from plot import FlightLog, plot_flight
 
+
 # ----------------------------------------------------------------------------
-# Configuration
+# PID (anti-windup, feed-forward, asymmetric limits) -- pure compute
 # ----------------------------------------------------------------------------
-CONNECTION    = "udp:127.0.0.1:14550"
-RATE_HZ       = 10
-HOVER_THRUST  = 0.5
-REACH_TOL     = 0.1
-STREAM_TIMEOUT = 0.3
-
-# --- Altitude PID (error [m]; derivative on climb rate vz) ---
-ALT_KP, ALT_KI, ALT_KD, ALT_ILIM = 0.22, 0.09, 0.22, 0.20
-THRUST_MIN, THRUST_MAX = 0.05, 0.5
-CLIMB_RATE_MAX = 2.5   # [m/s] setpoint slew limit -> no windup, no violent climbs/drops
-
-# --- Horizontal velocity PIDs (error [m/s] -> tilt [rad]) ---
-VEL_KP_PITCH, VEL_KI_PITCH, VEL_KD_PITCH, VEL_ILIM_PITCH = 0.04, 0.01, 0.005, 0.05
-VEL_KP_ROLL,  VEL_KI_ROLL,  VEL_KD_ROLL,  VEL_ILIM_ROLL  = 0.04, 0.01, 0.005, 0.05
-TILT_MAX = math.radians(5)
-
-PITCH_SIGN = -1.0
-ROLL_SIGN  = 1.0
-
-D_WINDOW = 10
-STALE_WARN = 0.5
-
-
 class PID:
-    """PID with feed-forward, asymmetric output limits, and anti-windup.
-
-    Anti-windup (conditional integration): the integrator is committed only if
-    the output is NOT pinned against a limit while the error would push it
-    further into that limit. This is what stops the wind-up that made the
-    ground->15m climb overshoot and ring in the logged run.
-    """
     def __init__(self, kp, ki, kd, i_limit, out_min=None, out_max=None,
-                 feedforward=0.0, d_window=D_WINDOW):
+                 feedforward=0.0, d_window=10):
         self.kp, self.ki, self.kd = kp, ki, kd
         self.i_limit = i_limit
         self.out_min, self.out_max = out_min, out_max
@@ -81,15 +56,17 @@ class PID:
 
 
 class Controller:
-    def __init__(self, hover):
+    """Builds the axis PIDs from config; holds the yaw target."""
+    def __init__(self, hover, cfg: Settings):
+        self.cfg = cfg
+        a, p, r = cfg.altitude_pid, cfg.pitch_pid, cfg.roll_pid
         self.hover = hover
-        # altitude PID outputs THRUST directly (ff=hover, clamped to thrust limits)
-        self.alt   = PID(ALT_KP, ALT_KI, ALT_KD, ALT_ILIM,
-                         out_min=THRUST_MIN, out_max=THRUST_MAX, feedforward=hover)
-        self.pitch = PID(VEL_KP_PITCH, VEL_KI_PITCH, VEL_KD_PITCH, VEL_ILIM_PITCH,
-                         out_min=-TILT_MAX, out_max=TILT_MAX)
-        self.roll  = PID(VEL_KP_ROLL,  VEL_KI_ROLL,  VEL_KD_ROLL,  VEL_ILIM_ROLL,
-                         out_min=-TILT_MAX, out_max=TILT_MAX)
+        self.alt = PID(a.kp, a.ki, a.kd, a.i_limit, out_min=cfg.thrust_min,
+                       out_max=cfg.thrust_max, feedforward=hover, d_window=a.d_window)
+        self.pitch = PID(p.kp, p.ki, p.kd, p.i_limit, out_min=-cfg.tilt_max_rad,
+                         out_max=cfg.tilt_max_rad, d_window=p.d_window)
+        self.roll = PID(r.kp, r.ki, r.kd, r.i_limit, out_min=-cfg.tilt_max_rad,
+                        out_max=cfg.tilt_max_rad, d_window=r.d_window)
         self.yaw_target = None
 
     def reset(self):
@@ -98,6 +75,9 @@ class Controller:
         self.roll.reset()
 
 
+# ----------------------------------------------------------------------------
+# Math helpers
+# ----------------------------------------------------------------------------
 def euler_to_quat(roll, pitch, yaw):
     cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
     cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
@@ -120,6 +100,9 @@ def _pid_str(param_id):
     return param_id.split("\x00", 1)[0]
 
 
+# ----------------------------------------------------------------------------
+# Shared state (written only by reader_task)
+# ----------------------------------------------------------------------------
 class VehicleState:
     def __init__(self):
         self.alt = 0.0
@@ -241,18 +224,20 @@ class MavlinkCommunicator(object):
 
 
 class Copter(object):
-    def __init__(self, state, comm):
+    def __init__(self, state, comm, cfg: Settings):
         self.state = state
-        self.ctrl = None
         self.comm = comm
+        self.cfg = cfg
+        self.ctrl = None
         self.last_request_position = 0
-        self.log = FlightLog()          # telemetry for plotting
+        self.log = FlightLog()
 
     async def hold_altitude(self, target_alt, hold_time):
+        cfg = self.cfg
         print(f"\n=== Target {target_alt} m, hold {hold_time} s ===")
         self.ctrl.reset()
-        period = 1.0 / RATE_HZ
-        sp = self.state.alt            # slewed setpoint starts at current altitude
+        period = cfg.period
+        sp = self.state.alt
         reached_at = None
         last_print = 0.0
         last_t = time.monotonic()
@@ -271,20 +256,20 @@ class Copter(object):
                 dt = period
             dt = min(dt, 0.1)
 
-            # setpoint slew: ramp internal target toward final at CLIMB_RATE_MAX
-            sp += clamp(target_alt - sp, -CLIMB_RATE_MAX * dt, CLIMB_RATE_MAX * dt)
-            alt_err = target_alt - alt          # true error (reached-check + logging)
+            # setpoint slew: ramp internal target toward final at climb_rate_max
+            sp += clamp(target_alt - sp, -cfg.climb_rate_max_ms * dt,
+                        cfg.climb_rate_max_ms * dt)
+            alt_err = target_alt - alt       # true error (reached-check + logging)
             thrust = self.ctrl.alt.update(sp - alt, dt, meas_rate=vz)  # ff+clamp inside
 
             fwd   =  vx * math.cos(yaw) + vy * math.sin(yaw)
             right = -vx * math.sin(yaw) + vy * math.cos(yaw)
-            pitch = PITCH_SIGN * self.ctrl.pitch.update(-fwd, dt)
-            roll  = ROLL_SIGN  * self.ctrl.roll.update(-right, dt)
+            pitch = cfg.pitch_sign * self.ctrl.pitch.update(-fwd, dt)
+            roll  = cfg.roll_sign  * self.ctrl.roll.update(-right, dt)
 
             self.comm.send_attitude(euler_to_quat(roll, pitch, self.ctrl.yaw_target), thrust)
 
             drift = math.hypot(fwd, right)
-            # log one sample per cycle (P/I/D are the altitude PID's own terms)
             self.log.add(target=target_alt, alt=alt, err=alt_err, thrust=thrust,
                          vz=vz, p=self.ctrl.alt.p_term, i=self.ctrl.alt.i_term,
                          d=self.ctrl.alt.d_term, roll=roll, pitch=pitch, drift=drift)
@@ -297,17 +282,19 @@ class Copter(object):
                 last_print = now
 
             if reached_at is None:
-                if abs(alt_err) < REACH_TOL:
+                if abs(alt_err) < cfg.reach_tol_m:
                     reached_at = now
                     print(f"Reached {target_alt} m -- holding {hold_time} s")
             elif now - reached_at >= hold_time:
                 print(f"Hold at {target_alt} m complete")
                 return
 
-            if (now - self.state.last_pos_t > STREAM_TIMEOUT) and (now - self.last_request_position > 1):
+            if (now - self.state.last_pos_t > cfg.stream_timeout_s) and \
+               (now - self.last_request_position > 1):
                 print('warning! pos timeout reached')
-                self.comm.request_position_stream(RATE_HZ)
+                self.comm.request_position_stream(cfg.rate_hz)
                 self.last_request_position = now
+
             next_tick += period
             delay = next_tick - time.monotonic()
             if delay > 0:
@@ -327,45 +314,49 @@ class Copter(object):
             await asyncio.sleep(0.5)
         print("WARNING: still armed after LAND timeout")
 
-    async def arm(self):
-        await self.comm.set_param(self.state, "GUID_OPTIONS", 8)
-        await self.comm.set_param(self.state, "FRAME_CLASS", 1)
-        await self.comm.set_param(self.state, "FRAME_TYPE", 1)
-        print(f"GUID_OPTIONS readback = {await self.comm.get_param(self.state, 'GUID_OPTIONS')}")
+    async def prepare(self):
+        # startup ArduPilot params from config (GUID_OPTIONS, FRAME_CLASS, ...)
+        for name, val in self.cfg.ardupilot_params.items():
+            await self.comm.set_param(self.state, name, val)
 
-        hover = await self.comm.get_param(self.state, "MOT_THST_HOVER", HOVER_THRUST) or HOVER_THRUST
+        hover = await self.comm.get_param(self.state, "MOT_THST_HOVER",
+                                          self.cfg.hover_default) or self.cfg.hover_default
         print(f"Hover thrust feed-forward: {hover:.3f}")
 
-        self.comm.request_position_stream(RATE_HZ)
+        self.comm.request_position_stream(self.cfg.rate_hz)
         await self.comm.wait_for_position(self.state)
 
         await self.comm.set_mode(self.state, "GUIDED")
         await self.comm.arm(self.state)
-        self.ctrl = Controller(hover)
+        self.ctrl = Controller(hover, self.cfg)
+
+    async def fly_mission(self):
+        for ph in self.cfg.phases:
+            await self.hold_altitude(ph.target_m, ph.hold_s)
 
 
-def connect(conn_str):
-    m = mavutil.mavlink_connection(conn_str)
-    print(f"Waiting for heartbeat on {conn_str} ...")
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def connect(address):
+    m = mavutil.mavlink_connection(address)
+    print(f"Waiting for heartbeat on {address} ...")
     m.wait_heartbeat()
     print(f"Heartbeat from system {m.target_system} component {m.target_component}")
     return m
 
 
-async def main():
-    m = connect(CONNECTION)
+async def main(cfg: Settings):
+    print(cfg.summary())
+    m = connect(cfg.connection_address)
     state = VehicleState()
     comm = MavlinkCommunicator(m)
     reader = asyncio.create_task(comm.reader_task(state))
-    copter = Copter(state, comm)
+    copter = Copter(state, comm, cfg)
     try:
-        await copter.arm()
+        await copter.prepare()
         try:
-            await copter.hold_altitude(target_alt=14.5, hold_time=2)
-            await copter.hold_altitude(target_alt=15.0, hold_time=15.0)
-            await copter.hold_altitude(target_alt=10.5, hold_time=2)
-            await copter.hold_altitude(target_alt=10.0, hold_time=15.0)
-            await copter.hold_altitude(target_alt=1.0,  hold_time=2)
+            await copter.fly_mission()
         finally:
             await copter.land_and_wait()
     finally:
@@ -374,11 +365,15 @@ async def main():
             await reader
         except asyncio.CancelledError:
             pass
-        # render whatever telemetry we collected (works for partial runs too)
         if len(copter.log):
-            copter.log.to_csv("flight_log.csv")
-            plot_flight(copter.log, save_path="flight_plot.png", show=True)
+            copter.log.to_csv(cfg.csv_path)
+            plot_flight(copter.log, save_path=cfg.plot_path, show=cfg.show_plot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    try:
+        cfg = Settings.load(config_path)
+    except ConfigError as e:
+        sys.exit(f"config error: {e}")
+    asyncio.run(main(cfg))

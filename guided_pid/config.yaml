@@ -1,0 +1,66 @@
+# ============================================================================
+# config.yaml -- all tunable parameters for the altitude-hold controller.
+# Edit values here; the flight code reads them via settings.Settings.load().
+# Units are human-friendly (degrees, m/s); settings.py converts as needed.
+# ============================================================================
+
+connection:
+  address: "udp:127.0.0.1:14550"
+
+control:
+  rate_hz: 10            # control-loop frequency
+  reach_tol_m: 0.1       # |error| under this counts as "reached target"
+  climb_rate_max_ms: 2.5 # setpoint slew limit (prevents windup / violent moves)
+  stream_timeout_s: 0.3  # re-request position stream if telemetry older than this
+  stale_warn_s: 0.5      # flag telemetry as stale in the console past this age
+
+thrust:
+  hover_default: 0.5     # feed-forward fallback if MOT_THST_HOVER is unavailable
+  min: 0.0
+  max: 0.5
+
+altitude_pid:            # altitude error [m] -> thrust
+  kp: 0.22
+  ki: 0.09
+  kd: 0.22
+  i_limit: 0.20
+  d_window: 10
+
+pitch_pid:               # body-forward velocity [m/s] -> pitch [rad]
+  kp: 0.04
+  ki: 0.01
+  kd: 0.005
+  i_limit: 0.05
+  d_window: 10
+
+roll_pid:                # body-right velocity [m/s] -> roll [rad]
+  kp: 0.04
+  ki: 0.01
+  kd: 0.005
+  i_limit: 0.05
+  d_window: 10
+
+attitude:
+  tilt_max_deg: 5.0      # max commanded roll/pitch (converted to radians in code)
+  pitch_sign: -1.0       # flip if the copter accelerates INTO fore/aft drift
+  roll_sign: 1.0         # flip if the copter accelerates INTO left/right drift
+
+# ArduPilot parameters set at startup (name: value)
+ardupilot_params:
+  GUID_OPTIONS: 8        # bit 3: SET_ATTITUDE_TARGET thrust = raw thrust 0..1
+  FRAME_CLASS: 1         # Quad
+  FRAME_TYPE: 1          # X
+
+# Flight plan: each phase climbs/descends to target_m then holds hold_s seconds
+mission:
+  phases:
+    - {target_m: 14.5, hold_s: 2}
+    - {target_m: 15.0, hold_s: 15}
+    - {target_m: 10.5, hold_s: 2 }
+    - {target_m: 10.0, hold_s: 15}
+    - {target_m: 1.0,  hold_s: 2}
+
+logging:
+  csv_path: "flight_log.csv"
+  plot_path: "flight_plot.png"
+  show_plot: true
