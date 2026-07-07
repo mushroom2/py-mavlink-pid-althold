@@ -266,7 +266,7 @@ class Settings:
 
 
 if __name__ == "__main__":
-    # Self-test: load the real config and exercise validation on bad inputs.
+    # Self-tests: load the real config and exercise validation on bad inputs.
     cfg = Settings.load("config.yaml")
     print(cfg.summary())
     print("phases:", cfg.phases)

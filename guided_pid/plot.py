@@ -119,7 +119,7 @@ def plot_flight(log, save_path="flight_plot.png", show=True):
     return fig
 
 
-# --- Self-test: fabricate a plausible flight so the layout can be previewed ---
+# --- Self-tests: fabricate a plausible flight so the layout can be previewed ---
 if __name__ == "__main__":
     import math
 

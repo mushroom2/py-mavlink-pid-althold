@@ -35,7 +35,7 @@ except ImportError:
     sys.modules["pymavlink"] = _mav
     sys.modules["pymavlink.mavutil"] = _mavutil
 
-from alt_hold_pid_async import (
+from alt_hold_pid import (
     PID, Controller, clamp, euler_to_quat,
     target_point, horizontal_velocity_setpoint,
 )
@@ -212,7 +212,7 @@ class TestSettings(unittest.TestCase):
 
 
 # ============================================================================
-# Integration smoke test: config -> Controller wiring
+# Integration smoke tests: config -> Controller wiring
 # ============================================================================
 class TestControllerWiring(unittest.TestCase):
     def test_builds_from_config(self):
