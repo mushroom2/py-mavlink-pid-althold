@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Altitude + drift hold via SET_ATTITUDE_TARGET (thrust-as-thrust) -- ASYNC version.
+Altitude + drift hold via SET_ATTITUDE_TARGET (thrust-as-thrust) -- ASYNC.
+
+All tunable values live in config.yaml and are loaded via settings.Settings.
+Run:  python3 alt_hold_pid_async.py [config.yaml]
 """
 
 import asyncio
@@ -11,7 +14,7 @@ from collections import deque
 
 from pymavlink import mavutil
 
-from settings import Settings, ConfigError
+from settings import Settings, ConfigError, Phase
 from plot import FlightLog, plot_flight
 
 
@@ -47,8 +50,8 @@ class PID:
         self.p_term, self.i_term, self.d_term = self.kp * error, integ, self.kd * d
         out = self.ff + self.p_term + self.i_term + self.d_term
 
-        lo = self.out_min
-        hi = self.out_max
+        lo = self.out_min if self.out_min is not None else -1e18
+        hi = self.out_max if self.out_max is not None else 1e18
         sat = max(lo, min(hi, out))
         if not ((out > hi and error > 0) or (out < lo and error < 0)):
             self.integral = integ
@@ -109,6 +112,9 @@ class VehicleState:
         self.vx = self.vy = self.vz = 0.0
         self.yaw = 0.0
         self.last_pos_t = 0.0
+        self.pos_n = 0.0            # north [m] from LOCAL_POSITION_NED
+        self.pos_e = 0.0            # east  [m]
+        self.last_local_t = 0.0
         self.mode = None
         self.armed = False
         self.params = {}
@@ -131,6 +137,13 @@ class MavlinkCommunicator(object):
             mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
             int(1e5 / hz), 0, 0, 0, 0, 0)
 
+    def request_local_stream(self, hz):
+        self.conn.mav.command_long_send(
+            self.conn.target_system, self.conn.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+            mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+            int(1e6 / hz), 0, 0, 0, 0, 0)
+
     async def reader_task(self, state):
         """Continuously drain the link and update shared state. Only caller of recv."""
         while True:
@@ -149,6 +162,10 @@ class MavlinkCommunicator(object):
                     if msg.hdg != 65535:
                         state.yaw = math.radians(msg.hdg / 100.0)
                     state.last_pos_t = time.time()
+                elif t == "LOCAL_POSITION_NED":
+                    state.pos_n = msg.x
+                    state.pos_e = msg.y
+                    state.last_local_t = time.time()
                 elif t == "HEARTBEAT":
                     state.mode = msg.custom_mode
                     state.armed = bool(msg.base_mode &
@@ -222,6 +239,15 @@ class MavlinkCommunicator(object):
             await asyncio.sleep(0.05)
         raise RuntimeError("No position estimate received")
 
+    async def wait_for_local(self, state, timeout=10.0):
+        t_end = time.time() + timeout
+        while time.time() < t_end:
+            if state.last_local_t > 0:
+                return True
+            await asyncio.sleep(0.05)
+        print("WARNING: no LOCAL_POSITION_NED -- position moves disabled")
+        return False
+
 
 class Copter(object):
     def __init__(self, state, comm, cfg: Settings):
@@ -232,12 +258,23 @@ class Copter(object):
         self.last_request_position = 0
         self.log = FlightLog()
 
-    async def hold_altitude(self, target_alt, hold_time):
+    async def hold_altitude(self, phase: Phase):
+        """Reach phase.target_m; if the phase has a move, fly to the point
+        (distance_m at bearing azimuth_deg from where altitude was reached);
+        the hold timer starts only once altitude AND position are satisfied."""
         cfg = self.cfg
-        print(f"\n=== Target {target_alt} m, hold {hold_time} s ===")
+        target_alt, hold_time = phase.target_m, phase.hold_s
+        label = f"{target_alt} m"
+        if phase.has_move:
+            label += f", move {phase.distance_m:g} m @ {phase.azimuth_deg:g}deg"
+        print(f"\n=== {label}, hold {hold_time} s ===")
+
         self.ctrl.reset()
         period = cfg.period
-        sp = self.state.alt
+        sp = self.state.alt              # slewed altitude setpoint
+        h_target = None                  # (north, east) once altitude reached
+        captured = False                 # have we captured the horizontal target?
+        move_active = phase.has_move
         reached_at = None
         last_print = 0.0
         last_t = time.monotonic()
@@ -256,43 +293,84 @@ class Copter(object):
                 dt = period
             dt = min(dt, 0.1)
 
-            # setpoint slew: ramp internal target toward final at climb_rate_max
+            # ---- altitude (slewed setpoint) -> thrust ----
             sp += clamp(target_alt - sp, -cfg.climb_rate_max_ms * dt,
                         cfg.climb_rate_max_ms * dt)
-            alt_err = target_alt - alt       # true error (reached-check + logging)
-            thrust = self.ctrl.alt.update(sp - alt, dt, meas_rate=vz)  # ff+clamp inside
+            alt_err = target_alt - alt
+            thrust = self.ctrl.alt.update(sp - alt, dt, meas_rate=vz)
+            alt_ok = abs(alt_err) < cfg.reach_tol_m
+            have_pos = self.state.last_local_t > 0
 
-            fwd   =  vx * math.cos(yaw) + vy * math.sin(yaw)
-            right = -vx * math.sin(yaw) + vy * math.cos(yaw)
-            pitch = cfg.pitch_sign * self.ctrl.pitch.update(-fwd, dt)
-            roll  = cfg.roll_sign  * self.ctrl.roll.update(-right, dt)
+            # ---- capture the horizontal target the moment altitude is reached ----
+            if alt_ok and not captured:
+                captured = True
+                if have_pos:
+                    ref_n, ref_e = self.state.pos_n, self.state.pos_e
+                    if move_active:
+                        az = math.radians(phase.azimuth_deg)
+                        h_target = (ref_n + phase.distance_m * math.cos(az),
+                                    ref_e + phase.distance_m * math.sin(az))
+                        print(f"[move] to N={h_target[0]:.1f} E={h_target[1]:.1f}")
+                    else:
+                        h_target = (ref_n, ref_e)      # station-keep here
+                else:
+                    if move_active:
+                        print("WARNING: no position -> skipping move, altitude-only hold")
+                    move_active = False                # cannot move without position
+
+            # ---- horizontal: position error -> velocity setpoint (NED) ----
+            if h_target is not None:
+                en = h_target[0] - self.state.pos_n
+                ee = h_target[1] - self.state.pos_e
+                dist_err = math.hypot(en, ee)
+                if dist_err > 1e-3:
+                    v_des = min(cfg.pos_kp * dist_err, cfg.pos_speed_max_ms)
+                    vset_n, vset_e = v_des * en / dist_err, v_des * ee / dist_err
+                else:
+                    vset_n = vset_e = 0.0
+            else:
+                dist_err = 0.0
+                vset_n = vset_e = 0.0                   # drift arrest (climb / no pos)
+
+            # ---- velocity error -> body frame -> tilt ----
+            evn, eve = vset_n - vx, vset_e - vy
+            err_fwd   =  evn * math.cos(yaw) + eve * math.sin(yaw)
+            err_right = -evn * math.sin(yaw) + eve * math.cos(yaw)
+            pitch = cfg.pitch_sign * self.ctrl.pitch.update(err_fwd, dt)
+            roll  = cfg.roll_sign  * self.ctrl.roll.update(err_right, dt)
 
             self.comm.send_attitude(euler_to_quat(roll, pitch, self.ctrl.yaw_target), thrust)
 
-            drift = math.hypot(fwd, right)
+            speed = math.hypot(vx, vy)
             self.log.add(target=target_alt, alt=alt, err=alt_err, thrust=thrust,
                          vz=vz, p=self.ctrl.alt.p_term, i=self.ctrl.alt.i_term,
-                         d=self.ctrl.alt.d_term, roll=roll, pitch=pitch, drift=drift)
+                         d=self.ctrl.alt.d_term, roll=roll, pitch=pitch, drift=speed)
 
             now = time.time()
             if now - last_print > 1.0:
-                print(f"alt={alt:6.2f}  err={alt_err:+5.2f}  thr={thrust:.3f} | "
-                      f"drift={drift:4.2f} m/s  roll={math.degrees(roll):+4.1f} "
+
+                extra = f" dist={dist_err:4.1f}m" if move_active else ""
+                print(f"alt={alt:6.2f} err={alt_err:+5.2f} thr={thrust:.3f}{extra} | "
+                      f"spd={speed:4.2f} roll={math.degrees(roll):+4.1f} "
                       f"pitch={math.degrees(pitch):+4.1f}")
                 last_print = now
 
+            # ---- hold timer: needs altitude AND (if moving) arrival at the point ----
+            pos_ready = (not move_active) or (h_target is not None
+                                              and dist_err < cfg.pos_reach_tol_m)
             if reached_at is None:
-                if abs(alt_err) < cfg.reach_tol_m:
+                if captured and alt_ok and pos_ready:
                     reached_at = now
-                    print(f"Reached {target_alt} m -- holding {hold_time} s")
+                    print(f"Arrived -- holding {hold_time} s")
             elif now - reached_at >= hold_time:
-                print(f"Hold at {target_alt} m complete")
+                print("Hold complete")
                 return
 
             if (now - self.state.last_pos_t > cfg.stream_timeout_s) and \
                (now - self.last_request_position > 1):
                 print('warning! pos timeout reached')
                 self.comm.request_position_stream(cfg.rate_hz)
+                self.comm.request_local_stream(cfg.rate_hz)
                 self.last_request_position = now
 
             next_tick += period
@@ -324,7 +402,9 @@ class Copter(object):
         print(f"Hover thrust feed-forward: {hover:.3f}")
 
         self.comm.request_position_stream(self.cfg.rate_hz)
+        self.comm.request_local_stream(self.cfg.rate_hz)
         await self.comm.wait_for_position(self.state)
+        await self.comm.wait_for_local(self.state)
 
         await self.comm.set_mode(self.state, "GUIDED")
         await self.comm.arm(self.state)
@@ -332,7 +412,7 @@ class Copter(object):
 
     async def fly_mission(self):
         for ph in self.cfg.phases:
-            await self.hold_altitude(ph.target_m, ph.hold_s)
+            await self.hold_altitude(ph)
 
 
 # ----------------------------------------------------------------------------

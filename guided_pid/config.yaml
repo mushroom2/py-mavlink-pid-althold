@@ -1,63 +1,69 @@
 # ============================================================================
-# config.yaml -- all tunable parameters for the altitude-hold controller.
-# Edit values here; the flight code reads them via settings.Settings.load().
-# Units are human-friendly (degrees, m/s); settings.py converts as needed.
+# config.yaml -- all tunable parameters for the altitude/position-hold app.
+# Units are human-friendly (degrees, m/s, Hz); settings.py converts as needed.
 # ============================================================================
 
 connection:
   address: "udp:127.0.0.1:14550"
 
 control:
-  rate_hz: 10            # control-loop frequency
-  reach_tol_m: 0.1       # |error| under this counts as "reached target"
-  climb_rate_max_ms: 2.5 # setpoint slew limit (prevents windup / violent moves)
-  stream_timeout_s: 0.3  # re-request position stream if telemetry older than this
-  stale_warn_s: 0.5      # flag telemetry as stale in the console past this age
+  rate_hz: 10
+  reach_tol_m: 0.1        # |altitude error| under this counts as "reached"
+  climb_rate_max_ms: 2.5  # altitude setpoint slew limit
+  stream_timeout_s: 0.3   # re-request stream if telemetry older than this
+  stale_warn_s: 0.5
 
 thrust:
-  hover_default: 0.5     # feed-forward fallback if MOT_THST_HOVER is unavailable
+  hover_default: 0.5
   min: 0.0
   max: 0.5
 
-altitude_pid:            # altitude error [m] -> thrust
+altitude_pid:             # altitude error [m] -> thrust
   kp: 0.22
   ki: 0.09
   kd: 0.22
   i_limit: 0.20
   d_window: 10
 
-pitch_pid:               # body-forward velocity [m/s] -> pitch [rad]
+pitch_pid:                # body-forward velocity error [m/s] -> pitch [rad]
   kp: 0.04
   ki: 0.01
   kd: 0.005
   i_limit: 0.05
   d_window: 10
 
-roll_pid:                # body-right velocity [m/s] -> roll [rad]
+roll_pid:                 # body-right velocity error [m/s] -> roll [rad]
   kp: 0.04
   ki: 0.01
   kd: 0.005
   i_limit: 0.05
   d_window: 10
+
+# Outer horizontal loop: position error [m] -> velocity setpoint [m/s]
+position:
+  kp: 0.5                 # velocity setpoint per metre of position error
+  speed_max_ms: 2.0       # max horizontal speed while flying to a point
+  reach_tol_m: 0.5        # within this distance of the point = "arrived"
 
 attitude:
-  tilt_max_deg: 5.0      # max commanded roll/pitch (converted to radians in code)
-  pitch_sign: -1.0       # flip if the copter accelerates INTO fore/aft drift
-  roll_sign: 1.0         # flip if the copter accelerates INTO left/right drift
+  tilt_max_deg: 5.0
+  pitch_sign: -1.0
+  roll_sign: 1.0
 
-# ArduPilot parameters set at startup (name: value)
 ardupilot_params:
-  GUID_OPTIONS: 8        # bit 3: SET_ATTITUDE_TARGET thrust = raw thrust 0..1
-  FRAME_CLASS: 1         # Quad
-  FRAME_TYPE: 1          # X
+  GUID_OPTIONS: 8
+  FRAME_CLASS: 1
+  FRAME_TYPE: 1
 
-# Flight plan: each phase climbs/descends to target_m then holds hold_s seconds
+# Flight plan. Each phase: climb/descend to target_m, optionally fly to a point
+# (distance_m at bearing azimuth_deg from where altitude was reached), then hold
+# hold_s seconds. Omit azimuth_deg/distance_m (or distance_m: 0) to just hold.
 mission:
   phases:
     - {target_m: 14.5, hold_s: 2}
-    - {target_m: 15.0, hold_s: 15}
-    - {target_m: 10.5, hold_s: 2 }
-    - {target_m: 10.0, hold_s: 15}
+    - {target_m: 15.0, hold_s: 15, azimuth_deg: 90,  distance_m: 10}   # fly 10 m East
+    - { target_m: 10.5, hold_s: 2 }
+    - {target_m: 10.0, hold_s: 15, azimuth_deg: 180, distance_m: 8}    # then 8 m South
     - {target_m: 1.0,  hold_s: 2}
 
 logging:

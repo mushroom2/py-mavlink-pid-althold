@@ -43,6 +43,7 @@ DEFAULTS: dict[str, Any] = {
     "altitude_pid": {"kp": 0.22, "ki": 0.09, "kd": 0.22, "i_limit": 0.20, "d_window": 10},
     "pitch_pid": {"kp": 0.04, "ki": 0.01, "kd": 0.005, "i_limit": 0.05, "d_window": 10},
     "roll_pid": {"kp": 0.04, "ki": 0.01, "kd": 0.005, "i_limit": 0.05, "d_window": 10},
+    "position": {"kp": 0.5, "speed_max_ms": 2.0, "reach_tol_m": 0.5},
     "attitude": {"tilt_max_deg": 5.0, "pitch_sign": -1.0, "roll_sign": 1.0},
     "ardupilot_params": {"GUID_OPTIONS": 8, "FRAME_CLASS": 1, "FRAME_TYPE": 1},
     "mission": {"phases": [
@@ -101,6 +102,12 @@ class PIDGains:
 class Phase:
     target_m: float
     hold_s: float
+    azimuth_deg: float = 0.0    # absolute compass bearing (0=N, 90=E)
+    distance_m: float = 0.0     # 0 => no move, just hold in place
+
+    @property
+    def has_move(self) -> bool:
+        return self.distance_m > 1e-6
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,10 @@ class Settings:
     tilt_max_rad: float
     pitch_sign: float
     roll_sign: float
+    # horizontal position loop
+    pos_kp: float
+    pos_speed_max_ms: float
+    pos_reach_tol_m: float
     # startup params + mission + logging
     ardupilot_params: dict
     phases: tuple
@@ -162,9 +173,12 @@ class Settings:
         ctrl, thr, att = c["control"], c["thrust"], c["attitude"]
 
         phases = tuple(
-            Phase(target_m=float(p["target_m"]), hold_s=float(p["hold_s"]))
+            Phase(target_m=float(p["target_m"]), hold_s=float(p["hold_s"]),
+                  azimuth_deg=float(p.get("azimuth_deg", 0.0)),
+                  distance_m=float(p.get("distance_m", 0.0)))
             for p in c["mission"]["phases"]
         )
+        pos = c["position"]
 
         s = cls(
             connection_address=str(c["connection"]["address"]),
@@ -182,6 +196,9 @@ class Settings:
             tilt_max_rad=math.radians(float(att["tilt_max_deg"])),
             pitch_sign=float(att["pitch_sign"]),
             roll_sign=float(att["roll_sign"]),
+            pos_kp=float(pos["kp"]),
+            pos_speed_max_ms=float(pos["speed_max_ms"]),
+            pos_reach_tol_m=float(pos["reach_tol_m"]),
             ardupilot_params=dict(c["ardupilot_params"]),
             phases=phases,
             csv_path=str(c["logging"]["csv_path"]),
@@ -214,15 +231,26 @@ class Settings:
                 raise ConfigError(f"attitude.{name} must be +1.0 or -1.0 (got {sign})")
         if not self.phases:
             raise ConfigError("mission.phases must contain at least one phase")
+        if self.pos_kp < 0:
+            raise ConfigError("position.kp must be >= 0")
+        if self.pos_speed_max_ms <= 0:
+            raise ConfigError("position.speed_max_ms must be > 0")
+        if self.pos_reach_tol_m <= 0:
+            raise ConfigError("position.reach_tol_m must be > 0")
         for i, p in enumerate(self.phases):
             if p.target_m < 0:
                 raise ConfigError(f"mission.phases[{i}].target_m must be >= 0")
             if p.hold_s < 0:
                 raise ConfigError(f"mission.phases[{i}].hold_s must be >= 0")
+            if p.distance_m < 0:
+                raise ConfigError(f"mission.phases[{i}].distance_m must be >= 0")
 
     # ---- pretty startup banner ----
     def summary(self) -> str:
-        ph = " -> ".join(f"{p.target_m:g}m/{p.hold_s:g}s" for p in self.phases)
+        def _ph(p):
+            base = f"{p.target_m:g}m/{p.hold_s:g}s"
+            return base + (f"(+{p.distance_m:g}m@{p.azimuth_deg:g}deg)" if p.has_move else "")
+        ph = " -> ".join(_ph(p) for p in self.phases)
         a = self.altitude_pid
         return (
             "Config:\n"
@@ -232,6 +260,7 @@ class Settings:
             f"  thrust        [{self.thrust_min}, {self.thrust_max}]  hover_ff={self.hover_default}\n"
             f"  climb slew    {self.climb_rate_max_ms} m/s\n"
             f"  tilt max      {self.tilt_max_deg:g} deg  (pitch_sign={self.pitch_sign}, roll_sign={self.roll_sign})\n"
+            f"  position loop kp={self.pos_kp} speed_max={self.pos_speed_max_ms} m/s tol={self.pos_reach_tol_m} m\n"
             f"  mission       {ph}\n"
         )
 
